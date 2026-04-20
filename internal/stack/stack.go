@@ -2,9 +2,13 @@ package stack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
+	"syscall"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -86,6 +90,14 @@ func (ns *NetStack) Run(input io.Reader, output io.Writer) error {
 
 	// Outbound：gVisor → VPN（output.Write 一次一个完整 IP 包即可；
 	// os.File 底层 write(fd, buf, n) 对 SOCK_DGRAM 自动按 datagram 发送）
+	//
+	// ⚠️ 历史 bug：早期代码在 output.Write 出错时直接 return，使整个出向 goroutine
+	// 永久退出，后续 gVisor 产生的所有出向包都静默堆积在 channel 里，表现为
+	// "浏览器并发请求几秒后全部 hang，DNS/TCP 集体超时且不恢复"。
+	//
+	// 真正的致命错误（fd 已关闭、EPIPE）才应该退出。瞬时错误（ENOBUFS：
+	// AF_UNIX SOCK_DGRAM 发送缓冲被 burst 打满；EMSGSIZE：单包超限）是可恢复的，
+	// 只 drop 这一个包，继续读下一个。
 	go func() {
 		for {
 			pkt := ns.Link.ReadContext(ctx)
@@ -93,11 +105,16 @@ func (ns *NetStack) Run(input io.Reader, output io.Writer) error {
 				return
 			}
 			buf := pkt.ToBuffer()
-			if _, err := output.Write(buf.Flatten()); err != nil {
-				buf.Release()
+			_, err := output.Write(buf.Flatten())
+			buf.Release()
+			if err == nil {
+				continue
+			}
+			if isFatalWriteErr(err) {
+				log.Printf("outbound write fatal, exiting: %v", err)
 				return
 			}
-			buf.Release()
+			log.Printf("outbound write transient (dropping 1 pkt): %v", err)
 		}
 	}()
 
@@ -120,4 +137,21 @@ func (ns *NetStack) Run(input io.Reader, output io.Writer) error {
 		})
 		ns.Link.InjectInbound(ipv4.ProtocolNumber, pk)
 	}
+}
+
+// isFatalWriteErr 判断写 VPN 出错是否致命，致命则出向 goroutine 该退出。
+// 非致命（例如 ENOBUFS 的瞬时缓冲打满、EMSGSIZE 的单包超限）只丢当前包继续跑，
+// 不能因为一次可恢复的错误就把整个出向链路永久打死。
+func isFatalWriteErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EBADF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ENOTCONN) {
+		return true
+	}
+	return false
 }
