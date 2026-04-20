@@ -107,6 +107,16 @@ func main() {
 		}
 		defer vpnFile.Close()
 		log.Printf("Using VPNFD=%d for tunnel I/O", fd)
+
+		// 诊断 VPNFD 的 socket 类型，确认 openconnect wire format 假设。
+		// openconnect/tun.c 里 openconnect_setup_tun_script 用 socketpair(AF_UNIX, SOCK_DGRAM, ...)
+		// 期待值：SOCK_DGRAM(2)；如果是 SOCK_STREAM(1) 说明假设错了。
+		if t, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_TYPE); err == nil {
+			kinds := map[int]string{1: "SOCK_STREAM", 2: "SOCK_DGRAM", 3: "SOCK_RAW", 4: "SOCK_RDM", 5: "SOCK_SEQPACKET"}
+			log.Printf("VPNFD socket type = %d (%s)", t, kinds[t])
+		} else {
+			log.Printf("VPNFD SO_TYPE query failed: %v", err)
+		}
 	} else {
 		log.Printf("VPNFD not set, falling back to stdin/stdout")
 		vpnFile = nil
