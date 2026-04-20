@@ -94,8 +94,35 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 5. 阻塞运行协议栈 I/O
-	if err := ns.Run(os.Stdin, os.Stdout); err != nil {
+	// 5. 获取 VPN 隧道 fd：openconnect --script-tun 通过 VPNFD 环境变量传递
+	var vpnFile *os.File
+	if vpnfdStr := os.Getenv("VPNFD"); vpnfdStr != "" {
+		fd, err := strconv.Atoi(vpnfdStr)
+		if err != nil {
+			log.Fatalf("Invalid VPNFD value %q: %v", vpnfdStr, err)
+		}
+		vpnFile = os.NewFile(uintptr(fd), "vpnfd")
+		if vpnFile == nil {
+			log.Fatalf("Failed to open VPNFD=%d", fd)
+		}
+		defer vpnFile.Close()
+		log.Printf("Using VPNFD=%d for tunnel I/O", fd)
+	} else {
+		log.Printf("VPNFD not set, falling back to stdin/stdout")
+		vpnFile = nil
+	}
+
+	// 6. 阻塞运行协议栈 I/O
+	var input *os.File
+	var output *os.File
+	if vpnFile != nil {
+		input = vpnFile
+		output = vpnFile
+	} else {
+		input = os.Stdin
+		output = os.Stdout
+	}
+	if err := ns.Run(input, output); err != nil {
 		if err != os.ErrClosed && !strings.Contains(err.Error(), "file already closed") {
 			log.Fatalf("Netstack runtime error: %v", err)
 		}
